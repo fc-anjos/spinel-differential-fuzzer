@@ -1,0 +1,76 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  fuzz-smoke:
+    runs-on: ubuntu-latest
+    env:
+      # Route sccache at the GitHub Actions cache backend. The Spinel Makefile
+      # already auto-wraps CC with sccache when it's on PATH (see its CC block),
+      # so populating PATH + this flag is all the build step needs.
+      SCCACHE_GHA_ENABLED: "true"
+      # Make the cache strictly best-effort: if the Actions cache backend is
+      # unreachable (transient GitHub outage returns an HTML error page, which
+      # otherwise aborts sccache server startup and fails every cc), fall back
+      # to compiling directly instead of breaking the build. A speedup must
+      # never be able to turn CI red.
+      SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
+    steps:
+      - name: Checkout (with Spinel submodule)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+
+      - name: Set up sccache (compiler cache, GHA backend)
+        uses: mozilla-actions/sccache-action@v0.0.6
+
+      - name: Build the Spinel toolchain
+        run: |
+          # `deps` fetches the pinned prism/rbs C sources; `all` compiles the
+          # spinel driver plus spinel_parse / spinel_analyze / spinel_codegen.
+          # The Makefile detects sccache on PATH and wraps each cc invocation,
+          # so unchanged objects come straight from the Actions cache.
+          #
+          # Probe the cache backend first. When the Actions cache service is
+          # having an outage it returns an HTML error page, which makes
+          # sccache's server refuse to start and would then fail every cc
+          # (SCCACHE_IGNORE_SERVER_IO_ERROR only covers mid-run blips, not the
+          # startup storage check). If the server can't come up, fall back to a
+          # plain build via the Makefile's NO_CCACHE=1 escape hatch. A build
+          # speedup must never be able to turn CI red.
+          if sccache --start-server; then
+            echo "sccache server up — building with compiler cache"
+            CACHE_FLAG=""
+          else
+            echo "::warning::sccache backend unavailable — building without compiler cache"
+            CACHE_FLAG="NO_CCACHE=1"
+          fi
+          make -C vendor/spinel deps $CACHE_FLAG
+          make -C vendor/spinel all $CACHE_FLAG
+
+      - name: Compiler cache stats
+        if: always()
+        # Tolerate failure: during a cache-backend outage --show-stats can't
+        # reach the server either, and this is diagnostics only.
+        run: sccache --show-stats || true
+
+      - name: Fuzzer module self-tests
+        run: |
+          ruby tools/fuzz/runner.rb
+          ruby tools/fuzz/generator.rb
+          ruby tools/fuzz/oracle.rb
+          ruby tools/fuzz/triage.rb
+          ruby -c tools/fuzz/classify_run.rb
+          ruby -c tools/fuzz/cross_opt.rb
+
+      - name: Fuzz smoke (differential lane, no sanitizer)
+        run: ruby tools/fuzz_spinel.rb --cases 20 --seed 1 --jobs 2 --no-sanitize --allow-failures

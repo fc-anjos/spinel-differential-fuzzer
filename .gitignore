@@ -1,0 +1,3 @@
+# Fuzzer scratch output (run dirs, progress.json, minimized repros)
+/tmp/
+tmp/fuzz/
